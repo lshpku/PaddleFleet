@@ -61,6 +61,76 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class NvtxBegin(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, name, *tensors):
+        paddle.base.core.nvprof_nvtx_push(name + "_fw")
+        nvtx_stack.append(name)
+        ctx.name = name
+        if name.startswith("decoder"):
+            record_event(name + " forward begin")
+        tensors = [(t.clone() if t.is_leaf else t) for t in tensors]
+        return tensors[0] if len(tensors) == 1 else tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        paddle.base.core.nvprof_nvtx_pop()
+        assert nvtx_stack, f"nvtx not closed: {ctx.name}"
+        name = nvtx_stack.pop()
+        assert name == ctx.name, f"nvtx not match: {name} and {ctx.name}"
+        if name.startswith("decoder"):
+            record_event(name + " backward end")
+        return grads[0] if len(grads) == 1 else grads
+
+
+class NvtxEnd(paddle.autograd.PyLayer):
+    @staticmethod
+    def forward(ctx, name, *tensors):
+        paddle.base.core.nvprof_nvtx_pop()
+        ctx.name = name
+        assert nvtx_stack, f"nvtx not closed: {ctx.name}"
+        name = nvtx_stack.pop()
+        assert name == ctx.name, f"nvtx not match: {name} and {ctx.name}"
+        if name.startswith("decoder"):
+            record_event(name + " forward end")
+        tensors = [(t.clone() if t.is_leaf else t) for t in tensors]
+        return tensors[0] if len(tensors) == 1 else tensors
+
+    @staticmethod
+    def backward(ctx, *grads):
+        paddle.base.core.nvprof_nvtx_push(ctx.name + "_bw")
+        nvtx_stack.append(ctx.name)
+        if ctx.name.startswith("decoder"):
+            record_event(ctx.name + " backward begin")
+        return grads[0] if len(grads) == 1 else grads
+
+
+def record_event(label):
+    begin_event = getattr(paddle, "begin_event", None)
+    if begin_event is None:
+        return
+
+    e = paddle.device.Event(enable_timing=True)
+    e.record()
+    paddle.event_queue.append((e, label))
+
+    while paddle.event_queue:
+        e, label = paddle.event_queue[0]
+        if e.query():
+            paddle.event_queue.popleft()
+            ms = begin_event.elapsed_time(e)
+            print(end=f"[record_event] {label} : {ms:.3f}\n")
+        else:
+            break
+
+
+nvtx_stack = []
+paddle.nvtx_begin = NvtxBegin.apply
+paddle.nvtx_end = NvtxEnd.apply
+paddle.event_queue = __import__("collections").deque()
+paddle.record_event = record_event
+
+
 def tensors_clone(outputs):
     """
     The tensors required for recompute_forward need to be cloned to prevent them from being released prematurely and becoming inaccessible.
@@ -1195,6 +1265,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         original_residual = hidden_states
         ori_dtype = hidden_states.dtype
 
+        hidden_states = paddle.nvtx_begin(f"decoder_{self.layer_number}", hidden_states)
+        print(end=f"decoder {self.layer_number} forward grad={int(paddle.is_grad_enabled())} "
+              f"use={paddle.device.memory_allocated()/2**30:.3f} "
+              f"buf={paddle.device.memory_reserved()/2**30:.3f}\n")
+
         # mHC: aggregate n-stream → 1-stream
         aggregated, h_res, h_post = self.self_attention_hyper_connection(
             hidden_states
@@ -1218,6 +1293,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         ):
             extra_kwargs["input_ids"] = kwargs["input_ids"]
 
+        input_layernorm_output = paddle.nvtx_begin("self_attn", input_layernorm_output)
         if rope_freqs_cis is not None:
             attention_output_with_bias = self.self_attn(
                 input_layernorm_output,
@@ -1244,6 +1320,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 in_recompute=in_recompute,
                 **extra_kwargs,
             )
+        attention_output_with_bias = (
+            paddle.nvtx_end("self_attn", attention_output_with_bias[0]),
+            attention_output_with_bias[1],
+        )
 
         # mHC: fused H_res + H_post + bias-dropout-add
         hidden_states = (
@@ -1319,6 +1399,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
 
         # MLP
+        post_attention_layernorm_output = paddle.nvtx_begin("mlp", post_attention_layernorm_output)
         if self.recompute_mlp:
             _mlp_input_ids = (
                 input_ids if isinstance(self.mlp, MoELayer) else None
@@ -1352,6 +1433,10 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 )
             else:
                 mlp_output_with_bias = self.mlp(post_attention_layernorm_output)
+        mlp_output_with_bias = (
+            paddle.nvtx_end("mlp", mlp_output_with_bias[0]),
+            mlp_output_with_bias[1],
+        )
 
         # mHC: fused H_res + H_post + bias-dropout-add
         hidden_states = self.mlp_hyper_connection.fused_h_res_h_post_bda(
@@ -1368,6 +1453,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if is_first_fwd:
             hidden_states.stop_gradient = False
 
+        hidden_states = paddle.nvtx_end(f"decoder_{self.layer_number}", hidden_states)
         return hidden_states
 
 

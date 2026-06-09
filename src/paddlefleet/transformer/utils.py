@@ -155,6 +155,10 @@ def get_doc_lens(startend_row_indices: paddle.Tensor) -> paddle.Tensor:
     Returns:
         doc_lens: [n_docs] int32 tensor of document lengths.
     """
+    # cached_doc_lens = getattr(startend_row_indices, "_doc_lens", None)
+    # if cached_doc_lens is not None:
+    #     return cached_doc_lens
+
     mask = startend_row_indices.flatten().cast("int64")
     seqlen = mask.shape[0]
     positions = paddle.arange(seqlen, dtype="int64")
@@ -166,6 +170,9 @@ def get_doc_lens(startend_row_indices: paddle.Tensor) -> paddle.Tensor:
     boundary_indices = paddle.nonzero(is_boundary).flatten()
     doc_ends = mask[boundary_indices]
     doc_lens = (doc_ends - boundary_indices).cast("int32")
+
+    # doc_lens = doc_lens.cpu()
+    # startend_row_indices._doc_lens = doc_lens
     return doc_lens
 
 

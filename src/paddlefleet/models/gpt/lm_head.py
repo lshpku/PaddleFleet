@@ -312,6 +312,9 @@ class GPTLMHead(ColumnParallelLinear):
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
 
+        paddle.record_event("lm_head begin")
+        hidden_states.register_hook(lambda _: paddle.record_event("lm_head end"))
+
         # Apply final Block Attention Residual if enabled
         if self.config.block_attention_residuals:
             blocks = dict_args.get("blocks", [])

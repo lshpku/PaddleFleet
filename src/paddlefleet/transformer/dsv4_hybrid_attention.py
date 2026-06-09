@@ -262,6 +262,8 @@ class DSv4HybridAttention(Attention):
         startend_row_indices = kwargs.get(
             "attn_mask_startend_row_indices", None
         )
+        # pre-compute and cache doc_lens to hide bubble
+        # get_doc_lens(startend_row_indices)
 
         # Get Q, K, V tensors
         # In CP mode, pass position_offset so RoPE uses correct global positions.
