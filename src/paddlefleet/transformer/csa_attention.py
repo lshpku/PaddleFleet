@@ -26,6 +26,7 @@ Components:
 from __future__ import annotations
 
 import os
+import queue
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -699,6 +700,7 @@ def _compute_fused_csa_indexer_loss_forward(
     indexer_backend: str = "tilelang",
     loss_mask: Tensor | None = None,
     global_valid_count: float | None = None,
+    indexer_topk_states: tuple[Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     from paddlefleet.tilelang_ops import (
         csa_attn_target_reducesum,
@@ -738,6 +740,8 @@ def _compute_fused_csa_indexer_loss_forward(
         )
         topk_probs = paddle.nn.functional.softmax(topk_scores, axis=-1)
         topk_probs = topk_probs * row_valid.cast(topk_probs.dtype)
+    elif indexer_topk_states is not None:
+        topk_indices, topk_probs = indexer_topk_states
     else:
         topk_indices, topk_probs = csa_indexer_topk_fwd(
             index_q,
@@ -1517,6 +1521,16 @@ class CompressedSparseAttention(FleetLayer):
         else:
             self.indexer = None
 
+        # Configure indexer refined-recompute
+        self._use_rr_indexer_topk = (
+            self.indexer is not None
+            and config.recompute_granularity == "full"
+            and config.recompute_modules is not None
+            and "indexer_topk" in config.recompute_modules
+        )
+        if self._use_rr_indexer_topk:
+            self._rr_indexer_topk_queue = queue.Queue()
+
     def _compute_indexer_compressed_topk_idxs(
         self,
         query: Tensor,
@@ -1610,6 +1624,11 @@ class CompressedSparseAttention(FleetLayer):
                 indexer_backend=backend,
                 loss_mask=loss_mask,
                 global_valid_count=global_valid_count,
+                indexer_topk_states=(
+                    self._rr_indexer_topk_queue.get_nowait()
+                    if self._use_rr_indexer_topk
+                    else None
+                ),
             )
             loss_state = (
                 q_indexer_bf,
@@ -1687,6 +1706,10 @@ class CompressedSparseAttention(FleetLayer):
                         ratio=self.compress_ratio,
                         topk_effective=attn_topk_effective,
                         valid_range=valid_range,
+                    )
+                if self._use_rr_indexer_topk:
+                    self._rr_indexer_topk_queue.put(
+                        (tl_topk_indices, _tl_topk_scores)
                     )
                 topk_indices_compressed = tl_topk_indices
 
@@ -2116,6 +2139,11 @@ class CompressedSparseAttention(FleetLayer):
                         seq_offset=position_offset,
                         loss_mask=loss_mask,
                         global_valid_count=global_valid_count,
+                        indexer_topk_states=(
+                            self._rr_indexer_topk_queue.get_nowait()
+                            if self._use_rr_indexer_topk
+                            else None
+                        ),
                     )
                     tilelang_indexer_loss_state = (
                         q_indexer_bf,
@@ -2245,7 +2273,7 @@ class CompressedSparseAttention(FleetLayer):
                     from paddlefleet.tilelang_ops import csa_indexer_topk_fwd
 
                     with paddle.no_grad():
-                        tl_topk_indices, _ = csa_indexer_topk_fwd(
+                        tl_topk_indices, tl_topk_probs = csa_indexer_topk_fwd(
                             q_indexer_bf,
                             k_indexer_global,
                             weights_indexer_bf,
@@ -2253,6 +2281,10 @@ class CompressedSparseAttention(FleetLayer):
                             topk_effective=attn_topk_effective,
                             seq_offset=position_offset,
                             valid_range=valid_range,
+                        )
+                    if self._use_rr_indexer_topk:
+                        self._rr_indexer_topk_queue.put(
+                            (tl_topk_indices, tl_topk_probs)
                         )
                     topk_indices_compressed = tl_topk_indices
 
