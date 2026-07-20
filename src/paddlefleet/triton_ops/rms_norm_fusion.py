@@ -278,3 +278,156 @@ class RMSNormFusionTriton(paddle.autograd.PyLayer):
         )
 
         return dx, dw
+
+
+@enable_compat_on_triton_kernel
+@triton.jit
+def rms_norm_weightless_fwd_kernel(
+    X_ptr,
+    Y_ptr,
+    Invvar_ptr,
+    stride_x_row: tl.constexpr,
+    N1: tl.constexpr,
+    actual_n2: tl.constexpr,  # actual normalize dim size
+    BLOCK_N2: tl.constexpr,  # power of 2, >= actual_n2
+    eps: tl.constexpr,
+):
+    """Weightless forward kernel (weight is implicitly all ones)."""
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    cols = tl.arange(0, BLOCK_N2)
+    mask = cols < actual_n2
+
+    for row_idx in range(pid, N1, num_programs):
+        x_offset = row_idx * stride_x_row
+        y_offset = row_idx * actual_n2
+
+        x = tl.load(X_ptr + x_offset + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+
+        var = tl.sum(x * x, axis=0) / actual_n2
+        invvar = 1.0 / tl.sqrt(var + eps)
+
+        y = x * invvar
+
+        tl.store(Y_ptr + y_offset + cols, y, mask=mask)
+        tl.store(Invvar_ptr + row_idx, invvar)
+
+
+@enable_compat_on_triton_kernel
+@triton.jit
+def rms_norm_weightless_bwd_dx_kernel(
+    DY_ptr,  # grad [n1, n2]
+    X_ptr,  # forward input [n1, n2]
+    Invvar_ptr,  # 1/rms [n1]
+    DX_ptr,  # dx output [n1, n2]
+    stride_x_row: tl.constexpr,
+    N1: tl.constexpr,
+    actual_n2: tl.constexpr,
+    BLOCK_N2: tl.constexpr,
+):
+    """
+    Weightless backward kernel: compute dx (weight is implicitly all ones).
+
+    dx_ij = invvar_i * (dy_ij - x_ij * invvar_i^2 * dot_i / N2)
+      where dot_i = sum_j(dy_ij * x_ij)
+    """
+    pid = tl.program_id(0)
+    num_programs = tl.num_programs(0)
+    cols = tl.arange(0, BLOCK_N2)
+    mask = cols < actual_n2
+
+    for row_idx in range(pid, N1, num_programs):
+        dy_offset = row_idx * actual_n2
+        x_offset = row_idx * stride_x_row
+        dx_offset = row_idx * actual_n2
+
+        dy = tl.load(DY_ptr + dy_offset + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        x = tl.load(X_ptr + x_offset + cols, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        invvar = tl.load(Invvar_ptr + row_idx)
+
+        # dot_i = sum_j(dy_ij * x_ij)
+        dot = tl.sum(dy * x, axis=0)
+
+        # dx_ij = invvar * (dy_ij - x_ij * invvar^2 * dot / N2)
+        dx = invvar * (dy - x * (invvar * invvar) * (dot / actual_n2))
+
+        tl.store(DX_ptr + dx_offset + cols, dx, mask=mask)
+
+
+class RMSNormWeightlessFusionTriton(paddle.autograd.PyLayer):
+    """Triton weightless RMSNorm with autograd support (weight = all ones)."""
+
+    @staticmethod
+    def forward(ctx, x, epsilon=1e-6):
+        """forward"""
+        orig_shape = x.shape
+        n2 = x.shape[-1]
+        block_n2 = triton.next_power_of_2(n2)
+        n1 = 1
+        for s in orig_shape[:-1]:
+            n1 *= s
+
+        if x.ndim >= 2:
+            stride_x_row = x.stride()[x.ndim - 2]
+        else:
+            stride_x_row = n2
+
+        y = paddle.empty(orig_shape, dtype=x.dtype)
+        invvar = paddle.empty([n1], dtype=paddle.float32)
+
+        ROWS_PER_PROG = 128
+        num_programs = min(
+            n1, max(1, (n1 + ROWS_PER_PROG - 1) // ROWS_PER_PROG)
+        )
+
+        rms_norm_weightless_fwd_kernel[(num_programs,)](
+            x,
+            y,
+            invvar,
+            stride_x_row,
+            n1,
+            n2,
+            BLOCK_N2=block_n2,
+            eps=epsilon,
+            num_warps=1 if block_n2 <= 256 else 4,
+        )
+
+        ctx.save_for_backward(x, invvar)
+        ctx.n1 = n1
+        ctx.n2 = n2
+        ctx.block_n2 = block_n2
+        ctx.stride_x_row = stride_x_row
+        ctx.num_programs = num_programs
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        """backward"""
+        x, invvar = ctx.saved_tensor()
+        n1 = ctx.n1
+        n2 = ctx.n2
+        block_n2 = ctx.block_n2
+        stride_x_row = ctx.stride_x_row
+        num_programs = ctx.num_programs
+
+        dx = paddle.empty(dy.shape, dtype=dy.dtype)
+
+        rms_norm_weightless_bwd_dx_kernel[(num_programs,)](
+            dy,
+            x,
+            invvar,
+            dx,
+            stride_x_row,
+            n1,
+            n2,
+            BLOCK_N2=block_n2,
+            num_warps=1 if block_n2 <= 256 else 4,
+        )
+
+        return dx

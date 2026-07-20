@@ -19,6 +19,7 @@ import paddle
 
 from paddlefleet.transformer.paddle_norm import RMSNorm
 from paddlefleet.transformer.transformer_config import TransformerConfig
+from paddlefleet.triton_ops import RMSNormWeightlessFusionTriton
 
 
 class TestRMSNormFusionTriton(unittest.TestCase):
@@ -66,6 +67,42 @@ class TestRMSNormFusionTriton(unittest.TestCase):
         )
         np.testing.assert_allclose(
             dw0.float(), dw1.float(), rtol=1e-4, atol=5e-3
+        )
+
+
+class TestRMSNormWeightlessFusionTriton(unittest.TestCase):
+    def setUp(self):
+        paddle.seed(2026)
+        self.eps = 1e-6
+
+    def _ref_weightless_rms_norm(self, x, eps):
+        x = x.float()
+        x = x * paddle.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+        return x.astype("bfloat16")
+
+        return x * paddle.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+
+    def test_forward_backward(self):
+        x = paddle.randn([1024, 128], dtype="bfloat16")
+        x.stop_gradient = False
+        dy = paddle.randn_like(x) * 0.01
+
+        # Reference
+        y0 = self._ref_weightless_rms_norm(x, self.eps)
+        y0.backward(dy)
+        dx0 = x.grad.clone()
+        x.grad = None
+
+        # Triton
+        y1 = RMSNormWeightlessFusionTriton.apply(x, self.eps)
+        y1.backward(dy)
+        dx1 = x.grad
+
+        np.testing.assert_allclose(
+            y0.float(), y1.float()
+        )  # , rtol=1e-2, atol=1e-3)
+        np.testing.assert_allclose(
+            dx0.float(), dx1.float(), rtol=1e-4, atol=1e-3
         )
 
 
