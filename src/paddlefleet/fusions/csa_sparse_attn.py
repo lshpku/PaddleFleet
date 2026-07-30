@@ -118,9 +118,11 @@ def _csa_compute_topk_length(topk_idxs_flat: Tensor) -> Tensor:
 
 
 class CSASparseAttention(paddle.autograd.PyLayer):
+    _lse_indexer = None
+
     @staticmethod
     def forward(
-        ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale, backend
+        ctx, query, kv_full, attn_sink, topk_idxs, softmax_scale, indexer_topk, backend
     ):
         from paddlefleet.fusions.csa_sparse_attn_utils import prepare_inputs
 
@@ -141,13 +143,23 @@ class CSASparseAttention(paddle.autograd.PyLayer):
                 flash_mla_sparse_attn,
             )
 
-            output, lse, _ = flash_mla_sparse_attn(
+            output, lse, lse_indexer = flash_mla_sparse_attn(
                 query,
                 kv_full,
                 attn_sink,
                 topk_idxs,
                 sm_scale=ctx.softmax_scale,
+                indexer_topk=indexer_topk,
             )
+            print(
+                "flash_mla:",
+                "query:", query.shape, query.dtype,
+                "kv_full:", kv_full.shape, kv_full.dtype,
+                "attn_sink:", attn_sink.shape, attn_sink.dtype,
+                "topk_idxs:", topk_idxs.shape, topk_idxs.dtype,
+                "sm_scale:", softmax_scale,
+            )
+            CSASparseAttention._lse_indexer = lse_indexer
         else:
             from paddlefleet.tilelang_ops.attn.sparse_mqa import sparse_attn
 
@@ -223,13 +235,14 @@ class CSASparseAttention(paddle.autograd.PyLayer):
 
 
 def csa_sparse_attn(
-    query, kv_full, attn_sink, topk_idxs, softmax_scale, backend="tilelang"
+    query, kv_full, attn_sink, topk_idxs, softmax_scale, indexer_topk, backend="tilelang"
 ):
     """Unified CSA sparse attention entry point.
 
     Args:
         backend: one of {"unfused", "tilelang", "cudnn"}.
     """
+    assert isinstance(indexer_topk, int)
     if backend == "unfused":
         return unfused_compressed_sparse_attn(
             query,
@@ -243,11 +256,19 @@ def csa_sparse_attn(
             f"csa_sparse_attn_backend={backend!r} is invalid. "
             "Must be one of {'unfused', 'tilelang', 'cudnn'}."
         )
-    return CSASparseAttention.apply(
+    output = CSASparseAttention.apply(
         query,
         kv_full,
         attn_sink,
         topk_idxs,
         softmax_scale,
+        indexer_topk,
         backend,
     )
+    print("indexer_topk:", indexer_topk,
+          "lse_indexer:", int(CSASparseAttention._lse_indexer is not None))
+    if CSASparseAttention._lse_indexer is None:
+        return output
+    lse_indexer = CSASparseAttention._lse_indexer
+    CSASparseAttention._lse_indexer = None
+    return output, lse_indexer
